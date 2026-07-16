@@ -52,6 +52,7 @@ COL_CAR_OR_SHOCKS = "color_mm5agxce"  # Car or Shocks?
 COL_DUE = "date5"                  # Due on
 COL_TURNAROUND = "timerange_mm52a7b2"  # Turn Around Time
 COL_SVC_NOTES = "text3"            # Service Writer Notes
+COL_HOURS = "numeric_mm0mfy8z"     # Hours (REQUIRED column — must be set on create)
 
 SHOPIFY_GQL = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
 MONDAY_GQL = "https://api.monday.com/v2"
@@ -197,6 +198,7 @@ def build_column_values(draft):
         COL_WO: name,
         COL_LINK: {"url": link, "text": f"Open Draft {name}"},
         COL_STATUS: {"label": "Same Day (Not Built)" if same_day else "New"},
+        COL_HOURS: "0",  # required column; techs fill actual hours in later
     }
     if car_or_shocks:
         cols[COL_CAR_OR_SHOCKS] = {"label": car_or_shocks}

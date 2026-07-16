@@ -32,7 +32,7 @@ services:
       - key: MONDAY_GROUP_ID
         value: "topics"
       - key: TZ
-        value: America/Denver      # correct local time for log timestamps
+        value: America/Phoenix      # Arizona MST (no DST) — matches store timezone
 
   # --- monday -> Shopify: append status log to each linked draft's note -------
   - type: cron
@@ -53,4 +53,4 @@ services:
       - key: SHOP_TZ_LABEL
         value: "MST"
       - key: TZ
-        value: America/Denver      # makes the host clock match the MST label
+        value: America/Phoenix      # Arizona MST (no DST) — matches the MST label
