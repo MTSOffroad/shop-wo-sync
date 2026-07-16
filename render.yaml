@@ -1,0 +1,56 @@
+# Render Blueprint — Shop Work Order Sync (MTS Off-Road)
+# -----------------------------------------------------------------------------
+# Defines two scheduled cron jobs that keep Shopify and the monday.com
+# "Shop Work Orders" board in sync. Import this in Render via:
+#   Dashboard → New → Blueprint → connect github.com/MTSOffroad/shop-wo-sync
+#
+# The three secret values (SHOPIFY_ACCESS_TOKEN, MONDAY_API_TOKEN, and the
+# store domain) are marked `sync: false`, so Render will PROMPT you to enter
+# them in the dashboard — they are never stored in this file or the repo.
+#
+# Tip: for the very first run, add DRY_RUN=true to each job's env in the
+# dashboard, confirm the logs look right, then remove it to go live.
+# -----------------------------------------------------------------------------
+
+services:
+  # --- Shopify -> monday: create board items for new shop_car_ drafts ---------
+  - type: cron
+    name: shop-wo-sync
+    runtime: python
+    schedule: "*/5 * * * *"        # every 5 minutes
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python sync.py"
+    envVars:
+      - key: SHOPIFY_STORE_DOMAIN
+        sync: false                # enter in dashboard
+      - key: SHOPIFY_ACCESS_TOKEN
+        sync: false                # secret — enter in dashboard
+      - key: MONDAY_API_TOKEN
+        sync: false                # secret — enter in dashboard
+      - key: MONDAY_BOARD_ID
+        value: "18422437311"
+      - key: MONDAY_GROUP_ID
+        value: "topics"
+      - key: TZ
+        value: America/Denver      # correct local time for log timestamps
+
+  # --- monday -> Shopify: append status log to each linked draft's note -------
+  - type: cron
+    name: shop-wo-status-sync
+    runtime: python
+    schedule: "*/5 * * * *"        # every 5 minutes
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python status_sync.py"
+    envVars:
+      - key: SHOPIFY_STORE_DOMAIN
+        sync: false                # enter in dashboard
+      - key: SHOPIFY_ACCESS_TOKEN
+        sync: false                # secret — enter in dashboard
+      - key: MONDAY_API_TOKEN
+        sync: false                # secret — enter in dashboard
+      - key: MONDAY_BOARD_ID
+        value: "18422437311"
+      - key: SHOP_TZ_LABEL
+        value: "MST"
+      - key: TZ
+        value: America/Denver      # makes the host clock match the MST label
