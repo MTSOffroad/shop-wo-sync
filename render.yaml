@@ -17,7 +17,7 @@ services:
   - type: cron
     name: shop-wo-sync
     runtime: python
-    schedule: "*/5 * * * *"        # every 5 minutes
+    schedule: "* * * * *"          # every minute
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python sync.py"
     envVars:
@@ -38,7 +38,7 @@ services:
   - type: cron
     name: shop-wo-status-sync
     runtime: python
-    schedule: "*/5 * * * *"        # every 5 minutes
+    schedule: "* * * * *"          # every minute
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python status_sync.py"
     envVars:
