@@ -72,6 +72,43 @@ def canonical_car_or_shocks(value):
         return None
     return _COS_BY_LOWER.get(str(value).strip().lower())
 
+
+def order_admin_url(order_legacy_id):
+    return f"https://admin.shopify.com/store/{SHOP_ADMIN_HANDLE}/orders/{order_legacy_id}"
+
+
+def draft_admin_url(draft_legacy_id):
+    return f"https://admin.shopify.com/store/{SHOP_ADMIN_HANDLE}/draft_orders/{draft_legacy_id}"
+
+
+def shopify_link_value(draft):
+    """The Shopify Link column value: point at the ORDER once the draft has been
+    paid/completed into one, otherwise the draft."""
+    order = draft.get("order") or {}
+    if order.get("legacyResourceId"):
+        return {"url": order_admin_url(order["legacyResourceId"]),
+                "text": f"Open Order {order.get('name') or ''}".strip()}
+    return {"url": draft_admin_url(draft["legacyResourceId"]),
+            "text": f"Open Draft {draft['name']}"}
+
+
+def parse_shopify_link(value):
+    """Return (kind, numeric_id) from a monday link column JSON value.
+    kind is 'draft', 'order', or None."""
+    if not value:
+        return (None, None)
+    try:
+        url = json.loads(value).get("url", "")
+    except Exception:
+        return (None, None)
+    m = re.search(r"/draft_orders/(\d+)", url)
+    if m:
+        return ("draft", m.group(1))
+    m = re.search(r"/orders/(\d+)", url)
+    if m:
+        return ("order", m.group(1))
+    return (None, None)
+
 COL_TURNAROUND = "timerange_mm52a7b2"  # Turn Around Time
 COL_SVC_NOTES = "text3"            # Service Writer Notes
 COL_HOURS = "numeric_mm0mfy8z"     # Hours (REQUIRED column — must be set on create)
@@ -153,7 +190,7 @@ def fetch_unsynced_shop_drafts():
             tags
             email
             status
-            order { id legacyResourceId tags }
+            order { id legacyResourceId name tags }
             customer { displayName }
             metafields(first: 30) {
               edges { node { namespace key value type } }
@@ -257,8 +294,6 @@ def monday_gql(query, variables=None):
 def build_column_values(draft):
     mf = draft["_mf"]
     name = draft["name"]  # e.g. #D8297
-    legacy_id = draft["legacyResourceId"]
-    link = f"https://admin.shopify.com/store/{SHOP_ADMIN_HANDLE}/draft_orders/{legacy_id}"
 
     same_day = str(mf.get("same_day_", "")).lower() == "true"
     car_or_shocks = canonical_car_or_shocks(mf.get("car_or_shocks_"))
@@ -276,7 +311,7 @@ def build_column_values(draft):
 
     cols = {
         COL_WO: name,
-        COL_LINK: {"url": link, "text": f"Open Draft {name}"},
+        COL_LINK: shopify_link_value(draft),
         COL_STATUS: {"label": "Same Day (Not Built)" if same_day else "New"},
         COL_HOURS: hours_val,  # from custom.job_hours_; 0 if unset
         # Powdercoat flag: "Powdercoat Needed" if the metafield is filled, else "None".
@@ -465,17 +500,16 @@ def fetch_board_items_full():
         for it in page["items"]:
             cv = {c["id"]: c for c in it["column_values"]}
             link_val = (cv.get("link_mm5ardz5") or {}).get("value")
-            draft_id = None
+            kind, ref_id = parse_shopify_link(link_val)
+            link_url = ""
             if link_val:
                 try:
-                    url = json.loads(link_val).get("url", "")
+                    link_url = json.loads(link_val).get("url", "")
                 except Exception:
-                    url = ""
-                m = re.search(r"/draft_orders/(\d+)", url)
-                if m:
-                    draft_id = m.group(1)
+                    link_url = ""
             items.append({
-                "item_id": it["id"], "name": it["name"], "draft_id": draft_id,
+                "item_id": it["id"], "name": it["name"],
+                "kind": kind, "ref_id": ref_id, "link_url": link_url,
                 "date": (cv.get("date5") or {}).get("text") or "",
                 "svc_notes": (cv.get("text3") or {}).get("text") or "",
                 "car_or_shocks": (cv.get("color_mm5agxce") or {}).get("text") or "",
@@ -488,12 +522,46 @@ def fetch_board_items_full():
     return items
 
 
-def fetch_drafts_by_ids(draft_ids):
-    """Batch-fetch current draft data keyed by legacyResourceId."""
-    query = """
-    query DraftsByIds($ids: [ID!]!) {
+def _entity_from_node(node, order):
+    mf = {e["node"]["key"]: e["node"]["value"]
+          for e in node["metafields"]["edges"]
+          if e["node"]["namespace"] == "custom"}
+    return {"name": node["name"], "email": node.get("email"),
+            "customer": node.get("customer"), "_mf": mf, "order": order}
+
+
+def fetch_entities(items):
+    """Batch-fetch current Shopify data for board items, keyed by (kind, id).
+    Both drafts and orders carry the same custom metafields; draft entities also
+    carry their linked `order` (once paid) so the link can be upgraded."""
+    draft_ids = sorted({it["ref_id"] for it in items if it["kind"] == "draft" and it["ref_id"]})
+    order_ids = sorted({it["ref_id"] for it in items if it["kind"] == "order" and it["ref_id"]})
+    result = {}
+
+    draft_q = """
+    query Drafts($ids: [ID!]!) {
       nodes(ids: $ids) {
         ... on DraftOrder {
+          legacyResourceId name email
+          customer { displayName }
+          order { legacyResourceId name }
+          metafields(first: 30) { edges { node { namespace key value } } }
+        }
+      }
+    }
+    """
+    for i in range(0, len(draft_ids), 50):
+        gids = [f"gid://shopify/DraftOrder/{d}" for d in draft_ids[i:i + 50]]
+        data = shopify_gql(draft_q, {"ids": gids})
+        for node in data.get("nodes", []):
+            if node:
+                result[("draft", node["legacyResourceId"])] = \
+                    _entity_from_node(node, node.get("order"))
+
+    order_q = """
+    query Orders($ids: [ID!]!) {
+      nodes(ids: $ids) {
+        ... on Order {
           legacyResourceId name email
           customer { displayName }
           metafields(first: 30) { edges { node { namespace key value } } }
@@ -501,21 +569,12 @@ def fetch_drafts_by_ids(draft_ids):
       }
     }
     """
-    result = {}
-    uniq = sorted({i for i in draft_ids if i})
-    for i in range(0, len(uniq), 50):
-        gids = [f"gid://shopify/DraftOrder/{d}" for d in uniq[i:i + 50]]
-        data = shopify_gql(query, {"ids": gids})
+    for i in range(0, len(order_ids), 50):
+        gids = [f"gid://shopify/Order/{d}" for d in order_ids[i:i + 50]]
+        data = shopify_gql(order_q, {"ids": gids})
         for node in data.get("nodes", []):
-            if not node:
-                continue
-            mf = {e["node"]["key"]: e["node"]["value"]
-                  for e in node["metafields"]["edges"]
-                  if e["node"]["namespace"] == "custom"}
-            result[node["legacyResourceId"]] = {
-                "name": node["name"], "email": node.get("email"),
-                "customer": node.get("customer"), "_mf": mf,
-            }
+            if node:
+                result[("order", node["legacyResourceId"])] = _entity_from_node(node, None)
     return result
 
 
@@ -527,14 +586,23 @@ def _hours_str(mf):
         return "0"
 
 
-def diff_shopify_fields(item, draft):
+def diff_shopify_fields(item, entity):
     """Return {column_id: value} of Shopify-owned fields that changed on `item`."""
-    mf = draft["_mf"]
+    mf = entity["_mf"]
     changes = {}
 
-    desired_name = item_name_for(draft)
+    desired_name = item_name_for(entity)
     if desired_name and desired_name != item["name"]:
         changes["name"] = desired_name
+
+    # Upgrade the Shopify Link from the draft to the ORDER once it's been paid.
+    if item["kind"] == "draft":
+        order = entity.get("order") or {}
+        if order.get("legacyResourceId"):
+            order_url = order_admin_url(order["legacyResourceId"])
+            if item["link_url"] != order_url:
+                changes[COL_LINK] = {"url": order_url,
+                                     "text": f"Open Order {order.get('name') or ''}".strip()}
 
     due = mf.get("due_date")
     if due and due != item["date"]:
@@ -572,21 +640,23 @@ def update_existing_items():
     items = fetch_board_items_full()
     if not items:
         return 0
-    drafts = fetch_drafts_by_ids([it["draft_id"] for it in items])
+    entities = fetch_entities(items)
     updated = 0
     for it in items:
-        d = drafts.get(it["draft_id"])
-        if not d:
-            continue  # draft deleted / not found
-        changes = diff_shopify_fields(it, d)
+        if not it["kind"] or not it["ref_id"]:
+            continue
+        ent = entities.get((it["kind"], it["ref_id"]))
+        if not ent:
+            continue  # draft/order deleted or not found
+        changes = diff_shopify_fields(it, ent)
         if not changes:
             continue
         try:
             set_item_columns(it["item_id"], changes)
-            log(f"  ~ {d['name']} updated: {', '.join(changes.keys())}")
+            log(f"  ~ {ent['name']} updated: {', '.join(changes.keys())}")
             updated += 1
         except Exception as e:
-            log(f"  ✗ update {d.get('name')} FAILED: {e}")
+            log(f"  ✗ update {ent.get('name')} FAILED: {e}")
     return updated
 
 

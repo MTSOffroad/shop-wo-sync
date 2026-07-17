@@ -133,23 +133,31 @@ def fetch_board_items():
             cv = {c["id"]: c for c in it["column_values"]}
             status = (cv.get(COL_STATUS) or {}).get("text") or ""
             job_type = (cv.get(COL_CAR_OR_SHOCKS) or {}).get("text") or ""
-            link_val = (cv.get(COL_LINK) or {}).get("value")
-            draft_id = None
-            if link_val:
-                try:
-                    url = json.loads(link_val).get("url", "")
-                except Exception:
-                    url = ""
-                m = re.search(r"/draft_orders/(\d+)", url)
-                if m:
-                    draft_id = m.group(1)
-            if status and draft_id:
+            kind, ref_id = parse_shopify_link((cv.get(COL_LINK) or {}).get("value"))
+            if status and kind and ref_id:
                 items.append({"name": it["name"], "status": status,
-                              "job_type": job_type, "draft_id": draft_id})
+                              "job_type": job_type, "kind": kind, "ref_id": ref_id})
         cursor = page.get("cursor")
         if not cursor:
             break
     return items
+
+
+def parse_shopify_link(value):
+    """Return (kind, numeric_id) from a monday link column JSON value."""
+    if not value:
+        return (None, None)
+    try:
+        url = json.loads(value).get("url", "")
+    except Exception:
+        return (None, None)
+    m = re.search(r"/draft_orders/(\d+)", url)
+    if m:
+        return ("draft", m.group(1))
+    m = re.search(r"/orders/(\d+)", url)
+    if m:
+        return ("order", m.group(1))
+    return (None, None)
 
 
 # --------------------------- Shopify ---------------------------
@@ -167,38 +175,27 @@ def shopify_gql(query, variables=None):
     return data["data"]
 
 
-def get_order_for_draft(draft_id):
-    """Given a draft's numeric id, return the linked Order's fulfillment state,
-    or None if the draft has no completed order yet."""
-    q = """
-    query DraftOrder($id: ID!) {
-      draftOrder(id: $id) {
+_ORDER_FIELDS = """
+  id
+  name
+  tags
+  displayFulfillmentStatus
+  fulfillmentOrders(first: 10) {
+    edges {
+      node {
         id
-        name
-        order {
-          id
-          name
-          tags
-          displayFulfillmentStatus
-          fulfillmentOrders(first: 10) {
-            edges {
-              node {
-                id
-                status
-                fulfillmentHolds { id reason }
-                lineItems(first: 50) { edges { node { id remainingQuantity } } }
-              }
-            }
-          }
-        }
+        status
+        fulfillmentHolds { id reason }
+        lineItems(first: 50) { edges { node { id remainingQuantity } } }
       }
     }
-    """
-    gid = f"gid://shopify/DraftOrder/{draft_id}"
-    d = shopify_gql(q, {"id": gid}).get("draftOrder")
-    if not d or not d.get("order"):
+  }
+"""
+
+
+def _order_state(o):
+    if not o:
         return None
-    o = d["order"]
     fos = [e["node"] for e in o["fulfillmentOrders"]["edges"]]
     return {
         "id": o["id"],
@@ -207,6 +204,21 @@ def get_order_for_draft(draft_id):
         "fulfillment_status": o.get("displayFulfillmentStatus") or "",
         "fulfillment_orders": fos,
     }
+
+
+def get_order(kind, ref_id):
+    """Return the Order's fulfillment state for a board item, or None if there is
+    no paid order yet. Handles BOTH a draft link (resolve draft->order) and an
+    order link (query the order directly)."""
+    if kind == "order":
+        q = "query O($id: ID!) { order(id: $id) { %s } }" % _ORDER_FIELDS
+        o = shopify_gql(q, {"id": f"gid://shopify/Order/{ref_id}"}).get("order")
+        return _order_state(o)
+    q = "query D($id: ID!) { draftOrder(id: $id) { id order { %s } } }" % _ORDER_FIELDS
+    d = shopify_gql(q, {"id": f"gid://shopify/DraftOrder/{ref_id}"}).get("draftOrder")
+    if not d:
+        return None
+    return _order_state(d.get("order"))
 
 
 def order_tags_add(order_gid, tags):
@@ -402,7 +414,7 @@ def main():
 
     for it in items:
         try:
-            order = get_order_for_draft(it["draft_id"])
+            order = get_order(it["kind"], it["ref_id"])
             if not order:
                 no_order += 1  # still an unpaid draft — nothing to hold/fulfill
                 continue
