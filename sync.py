@@ -58,6 +58,25 @@ COL_HOURS = "numeric_mm0mfy8z"     # Hours (REQUIRED column — must be set on c
 # Its value is pushed to the monday "Hours" column so the two stay aligned.
 MF_HOURS = "job_hours_"
 
+# --- Powdercoat -------------------------------------------------------------
+# custom.powdercoat is a free-text metafield; ANY non-empty value flags the
+# work order as a powdercoat job. Its text (often the powder color) is carried
+# into the powdercoat card's notes.
+MF_POWDERCOAT = "powdercoat"
+COL_POWDERCOAT = "color_mm5bzr35"    # Shop board: Powdercoat status flag
+COL_PC_CARD_LINK = "link_mm5bknmg"   # Shop board: link to the powdercoat card
+
+# MTS Powdercoat Jobs board (7932059042) — the powdercoater's board.
+PC_BOARD_ID = "7932059042"
+PC_GROUP_NEW = "group_title"         # "New Orders" group
+PC_COL_SHIP_TO = "single_select__1"  # "Ship to" (Shop Car / Set of Shocks / ...)
+PC_COL_STATUS = "status"             # powder status ("New Orders" default)
+PC_COL_ORDER_NO = "text7__1"         # "Order #"
+PC_COL_NOTES = "text__1"             # "Notes"
+PC_COL_SHOP_LINK = "link_mm5b171t"   # link back to the Shop Work Orders item
+
+MONDAY_SUBDOMAIN = "mtsoffroad"       # for building monday item URLs
+
 SHOPIFY_GQL = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
 MONDAY_GQL = "https://api.monday.com/v2"
 
@@ -300,6 +319,90 @@ def create_monday_item(draft):
 
 
 # ---------------------------------------------------------------------------
+# Powdercoat: flag the shop item + create a card on the powdercoater's board
+# ---------------------------------------------------------------------------
+def is_powdercoat(draft):
+    return bool(str(draft["_mf"].get(MF_POWDERCOAT, "")).strip())
+
+
+def monday_item_url(board_id, item_id):
+    return f"https://{MONDAY_SUBDOMAIN}.monday.com/boards/{board_id}/pulses/{item_id}"
+
+
+def set_columns(board_id, item_id, cols, create_labels=False):
+    """Update columns on an existing monday item."""
+    if DRY_RUN:
+        log(f"    DRY_RUN: would set {json.dumps(cols)} on item {item_id}")
+        return
+    mutation = """
+    mutation SetCols($board: ID!, $item: ID!, $cols: JSON!, $clm: Boolean!) {
+      change_multiple_column_values(board_id: $board, item_id: $item,
+          column_values: $cols, create_labels_if_missing: $clm) { id }
+    }
+    """
+    monday_gql(mutation, {"board": board_id, "item": item_id,
+                          "cols": json.dumps(cols), "clm": create_labels})
+
+
+def create_powdercoat_card(draft, shop_item_id):
+    """Create an item on the MTS Powdercoat Jobs board for this job."""
+    mf = draft["_mf"]
+    name = item_name_for(draft)
+    order_no = draft["name"]
+    powder_txt = str(mf.get(MF_POWDERCOAT, "")).strip()
+    car_or_shocks = str(mf.get("car_or_shocks_", ""))
+    ship_to = "Set of Shocks" if "shock" in car_or_shocks.lower() else "Shop Car"
+    shop_url = monday_item_url(MONDAY_BOARD_ID, shop_item_id)
+
+    vehicle = f"{mf.get('year', '')} {mf.get('vehicle_model', '')}".strip()
+    notes = " | ".join(filter(None, [
+        f"Powder: {powder_txt}" if powder_txt else "Powdercoat job",
+        vehicle,
+        f"Shop WO {order_no}",
+    ]))
+
+    cols = {
+        PC_COL_SHIP_TO: {"label": ship_to},
+        PC_COL_STATUS: {"label": "New Orders"},
+        PC_COL_ORDER_NO: order_no,
+        PC_COL_NOTES: notes[:1900],
+        PC_COL_SHOP_LINK: {"url": shop_url, "text": f"Shop WO {order_no}"},
+    }
+    if DRY_RUN:
+        log(f"    DRY_RUN: would create powdercoat card '{name}' cols={json.dumps(cols)}")
+        return None
+    mutation = """
+    mutation CreatePC($board: ID!, $group: String!, $name: String!, $cols: JSON!) {
+      create_item(board_id: $board, group_id: $group, item_name: $name,
+                  column_values: $cols, create_labels_if_missing: false) { id }
+    }
+    """
+    data = monday_gql(mutation, {"board": PC_BOARD_ID, "group": PC_GROUP_NEW,
+                                 "name": name, "cols": json.dumps(cols)})
+    return data["create_item"]["id"]
+
+
+def handle_powdercoat(draft, shop_item_id):
+    """If this is a powdercoat job: flag the shop item, create the powder card,
+    and cross-link the two. Best-effort — caller wraps this so a failure here
+    never duplicates or blocks the main work-order sync."""
+    if not is_powdercoat(draft):
+        return
+    # 1. Flag the shop item (seed the "Powdercoat" label the first time).
+    set_columns(MONDAY_BOARD_ID, shop_item_id,
+                {COL_POWDERCOAT: {"label": "Powdercoat"}}, create_labels=True)
+    # 2. Create the powder card (already carries a link back to the shop item).
+    pc_id = create_powdercoat_card(draft, shop_item_id)
+    if not pc_id:
+        return
+    # 3. Link the shop item forward to the powder card.
+    pc_url = monday_item_url(PC_BOARD_ID, pc_id)
+    set_columns(MONDAY_BOARD_ID, shop_item_id,
+                {COL_PC_CARD_LINK: {"url": pc_url, "text": "Powdercoat Card"}})
+    log(f"    ↳ powdercoat card created: {pc_url}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -335,6 +438,12 @@ def main():
             mark_synced(draft)
             log(f"  ✓ {wo} -> monday item {item_id} (synced)")
             created += 1
+            # Powdercoat handling is best-effort: it runs after the WO is safely
+            # synced, so a powder-side failure never duplicates the shop item.
+            try:
+                handle_powdercoat(draft, item_id)
+            except Exception as e:
+                log(f"    ⚠ {wo}: powdercoat step failed (WO still synced): {e}")
         except Exception as e:
             log(f"  ✗ {wo} FAILED: {e}")
             failed += 1
