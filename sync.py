@@ -51,6 +51,27 @@ COL_LINK = "link_mm5ardz5"          # Shopify Link
 COL_STATUS = "status"              # Status
 COL_CAR_OR_SHOCKS = "color_mm5agxce"  # Car or Shocks?
 COL_DUE = "date5"                  # Due on
+
+# The board's canonical "Car or Shocks?" labels. The Shopify metafield sometimes
+# comes through with different casing (e.g. "Ship-In" vs the board's "Ship-in"),
+# which — with create_labels_if_missing=false — makes monday reject the WHOLE
+# item. So we normalize the metafield value to the board label case-insensitively.
+CAR_OR_SHOCKS_LABELS = [
+    "Car (Walk-in)",
+    "Set of Shocks (Walk-in)",
+    "Partial Set of Shocks (Walk-in)",
+    "Set of Shocks (Ship-in)",
+    "Partial Set of Shocks (Ship-in)",
+]
+_COS_BY_LOWER = {lbl.lower(): lbl for lbl in CAR_OR_SHOCKS_LABELS}
+
+
+def canonical_car_or_shocks(value):
+    """Map a raw car_or_shocks_ value to the board's exact label, or None."""
+    if not value:
+        return None
+    return _COS_BY_LOWER.get(str(value).strip().lower())
+
 COL_TURNAROUND = "timerange_mm52a7b2"  # Turn Around Time
 COL_SVC_NOTES = "text3"            # Service Writer Notes
 COL_HOURS = "numeric_mm0mfy8z"     # Hours (REQUIRED column — must be set on create)
@@ -240,7 +261,7 @@ def build_column_values(draft):
     link = f"https://admin.shopify.com/store/{SHOP_ADMIN_HANDLE}/draft_orders/{legacy_id}"
 
     same_day = str(mf.get("same_day_", "")).lower() == "true"
-    car_or_shocks = mf.get("car_or_shocks_")  # e.g. "Set of Shocks (Walk-in)"
+    car_or_shocks = canonical_car_or_shocks(mf.get("car_or_shocks_"))
     due = mf.get("due_date")  # "YYYY-MM-DD" or None
     svc_notes = mf.get("service_notes", "")
 
@@ -523,7 +544,7 @@ def diff_shopify_fields(item, draft):
     if svc != item["svc_notes"]:
         changes[COL_SVC_NOTES] = svc
 
-    cos = mf.get("car_or_shocks_")
+    cos = canonical_car_or_shocks(mf.get("car_or_shocks_"))
     if cos and cos != item["car_or_shocks"]:
         changes[COL_CAR_OR_SHOCKS] = {"label": cos}
 
