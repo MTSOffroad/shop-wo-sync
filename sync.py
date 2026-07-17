@@ -24,6 +24,7 @@ Optional (have sensible defaults):
 """
 
 import os
+import re
 import sys
 import json
 import datetime
@@ -398,6 +399,177 @@ def handle_powdercoat(draft):
 
 
 # ---------------------------------------------------------------------------
+# Update existing items when the Shopify draft/order changes
+# ---------------------------------------------------------------------------
+# We keep these SHOPIFY-OWNED fields in sync onto the existing board item:
+#   name (customer/dealer), Due date, Service Writer Notes, Car or Shocks,
+#   Hours (always from job_hours_), Powdercoat (Needed/None only).
+# We NEVER touch tech-owned fields (Status, Tech, Tech Notes) and NEVER revert a
+# "Powdercoat Ready" set by the powder board.
+def set_item_columns(item_id, cols):
+    if DRY_RUN:
+        log(f"    DRY_RUN: would update item {item_id}: {json.dumps(cols)}")
+        return
+    mutation = """
+    mutation SetCols($board: ID!, $item: ID!, $cols: JSON!) {
+      change_multiple_column_values(board_id: $board, item_id: $item,
+          column_values: $cols, create_labels_if_missing: false) { id }
+    }
+    """
+    monday_gql(mutation, {"board": MONDAY_BOARD_ID, "item": item_id,
+                          "cols": json.dumps(cols)})
+
+
+def fetch_board_items_full():
+    """Board items with the columns we may update + the linked draft id."""
+    query = """
+    query BoardItems($board: ID!, $cursor: String) {
+      boards(ids: [$board]) {
+        items_page(limit: 100, cursor: $cursor) {
+          cursor
+          items {
+            id
+            name
+            column_values(ids: ["date5","text3","color_mm5agxce",
+              "numeric_mm0mfy8z","color_mm5bzr35","link_mm5ardz5"]) { id text value }
+          }
+        }
+      }
+    }
+    """
+    items, cursor = [], None
+    while True:
+        data = monday_gql(query, {"board": MONDAY_BOARD_ID, "cursor": cursor})
+        page = data["boards"][0]["items_page"]
+        for it in page["items"]:
+            cv = {c["id"]: c for c in it["column_values"]}
+            link_val = (cv.get("link_mm5ardz5") or {}).get("value")
+            draft_id = None
+            if link_val:
+                try:
+                    url = json.loads(link_val).get("url", "")
+                except Exception:
+                    url = ""
+                m = re.search(r"/draft_orders/(\d+)", url)
+                if m:
+                    draft_id = m.group(1)
+            items.append({
+                "item_id": it["id"], "name": it["name"], "draft_id": draft_id,
+                "date": (cv.get("date5") or {}).get("text") or "",
+                "svc_notes": (cv.get("text3") or {}).get("text") or "",
+                "car_or_shocks": (cv.get("color_mm5agxce") or {}).get("text") or "",
+                "hours": (cv.get("numeric_mm0mfy8z") or {}).get("text") or "",
+                "powdercoat": (cv.get("color_mm5bzr35") or {}).get("text") or "",
+            })
+        cursor = page.get("cursor")
+        if not cursor:
+            break
+    return items
+
+
+def fetch_drafts_by_ids(draft_ids):
+    """Batch-fetch current draft data keyed by legacyResourceId."""
+    query = """
+    query DraftsByIds($ids: [ID!]!) {
+      nodes(ids: $ids) {
+        ... on DraftOrder {
+          legacyResourceId name email
+          customer { displayName }
+          metafields(first: 30) { edges { node { namespace key value } } }
+        }
+      }
+    }
+    """
+    result = {}
+    uniq = sorted({i for i in draft_ids if i})
+    for i in range(0, len(uniq), 50):
+        gids = [f"gid://shopify/DraftOrder/{d}" for d in uniq[i:i + 50]]
+        data = shopify_gql(query, {"ids": gids})
+        for node in data.get("nodes", []):
+            if not node:
+                continue
+            mf = {e["node"]["key"]: e["node"]["value"]
+                  for e in node["metafields"]["edges"]
+                  if e["node"]["namespace"] == "custom"}
+            result[node["legacyResourceId"]] = {
+                "name": node["name"], "email": node.get("email"),
+                "customer": node.get("customer"), "_mf": mf,
+            }
+    return result
+
+
+def _hours_str(mf):
+    raw = mf.get(MF_HOURS)
+    try:
+        return str(float(raw)) if raw not in (None, "") else "0"
+    except (TypeError, ValueError):
+        return "0"
+
+
+def diff_shopify_fields(item, draft):
+    """Return {column_id: value} of Shopify-owned fields that changed on `item`."""
+    mf = draft["_mf"]
+    changes = {}
+
+    desired_name = item_name_for(draft)
+    if desired_name and desired_name != item["name"]:
+        changes["name"] = desired_name
+
+    due = mf.get("due_date")
+    if due and due != item["date"]:
+        changes[COL_DUE] = {"date": due}
+
+    svc = (mf.get("service_notes") or "")[:1900]
+    if svc != item["svc_notes"]:
+        changes[COL_SVC_NOTES] = svc
+
+    cos = mf.get("car_or_shocks_")
+    if cos and cos != item["car_or_shocks"]:
+        changes[COL_CAR_OR_SHOCKS] = {"label": cos}
+
+    # Hours: always sync from Shopify. Compare as floats to avoid churn (4 vs 4.0).
+    desired_hours = _hours_str(mf)
+    try:
+        same_hours = item["hours"] not in (None, "") and \
+            float(item["hours"]) == float(desired_hours)
+    except (TypeError, ValueError):
+        same_hours = False
+    if not same_hours:
+        changes[COL_HOURS] = desired_hours
+
+    # Powdercoat: sync Needed/None, but never revert a "Powdercoat Ready".
+    if item["powdercoat"] != "Powdercoat Ready":
+        desired_pc = "Powdercoat Needed" if str(mf.get(MF_POWDERCOAT, "")).strip() else "None"
+        if desired_pc != item["powdercoat"]:
+            changes[COL_POWDERCOAT] = {"label": desired_pc}
+
+    return changes
+
+
+def update_existing_items():
+    """Push Shopify-owned field changes onto existing board items."""
+    items = fetch_board_items_full()
+    if not items:
+        return 0
+    drafts = fetch_drafts_by_ids([it["draft_id"] for it in items])
+    updated = 0
+    for it in items:
+        d = drafts.get(it["draft_id"])
+        if not d:
+            continue  # draft deleted / not found
+        changes = diff_shopify_fields(it, d)
+        if not changes:
+            continue
+        try:
+            set_item_columns(it["item_id"], changes)
+            log(f"  ~ {d['name']} updated: {', '.join(changes.keys())}")
+            updated += 1
+        except Exception as e:
+            log(f"  ✗ update {d.get('name')} FAILED: {e}")
+    return updated
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -417,19 +589,21 @@ def main():
     except Exception as e:
         die(f"Could not fetch Shopify drafts: {e}")
 
+    created, skipped, failed = 0, 0, 0
+
     if not drafts:
-        log("No un-synced shop_car_ drafts found. Nothing to do.")
-        return
+        log("No un-synced shop_car_ drafts found — skipping create pass.")
 
     # Authoritative dedup: which WO#s are already on the board. Guards against
     # tag lag / tags cleared on edit (either of which would else duplicate).
-    try:
-        existing_wos = fetch_existing_wo_numbers()
-    except Exception as e:
-        die(f"Could not read monday board for dedup: {e}")
-
-    log(f"Found {len(drafts)} candidate draft(s); {len(existing_wos)} WO(s) already on board.")
-    created, skipped, failed = 0, 0, 0
+    existing_wos = set()
+    if drafts:
+        try:
+            existing_wos = fetch_existing_wo_numbers()
+        except Exception as e:
+            die(f"Could not read monday board for dedup: {e}")
+        log(f"Found {len(drafts)} candidate draft(s); "
+            f"{len(existing_wos)} WO(s) already on board.")
 
     for draft in drafts:
         wo = draft["name"]
@@ -458,7 +632,15 @@ def main():
             log(f"  ✗ {wo} FAILED: {e}")
             failed += 1
 
-    log(f"Done. Created {created}, skipped {skipped}, failed {failed}.")
+    log(f"Done creating. Created {created}, skipped {skipped}, failed {failed}.")
+
+    # Second pass: push Shopify-owned field changes onto existing board items.
+    try:
+        updated = update_existing_items()
+        log(f"Done updating. {updated} existing item(s) refreshed from Shopify.")
+    except Exception as e:
+        log(f"Update pass failed: {e}")
+
     if failed:
         # Non-zero exit so the host's cron surfaces the failure in logs/alerts.
         sys.exit(2)
