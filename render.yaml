@@ -73,3 +73,20 @@ services:
         value: "18422437311"
       - key: TZ
         value: America/Phoenix
+
+  # --- MTS Powdercoat Jobs -> Shop Work Orders (Powdercoat Ready flag) ---------
+  - type: cron
+    name: shop-wo-powder-status
+    runtime: python
+    schedule: "* * * * *"          # every minute
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python powder_status_sync.py"
+    envVars:
+      - key: MONDAY_API_TOKEN
+        sync: false                # secret — enter in dashboard
+      - key: SHOP_BOARD_ID
+        value: "18422437311"
+      - key: POWDER_BOARD_ID
+        value: "7932059042"
+      - key: TZ
+        value: America/Phoenix
