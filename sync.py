@@ -70,6 +70,7 @@ PC_BOARD_ID = "7932059042"
 PC_GROUP_NEW = "group_title"         # "New Orders" group
 PC_COL_STATUS = "status"             # powder status
 PC_COL_NOTES = "text__1"             # "Notes" — holds the custom.powdercoat text
+PC_COL_ORDER_NO = "text7__1"         # "Order #" — WO# (plain text, so it's filterable)
 PC_COL_DRAFT_LINK = "link_mm5b171t"  # "Draft Order" — link back to the Shopify draft
 
 SHOPIFY_GQL = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
@@ -342,6 +343,9 @@ def handle_powdercoat(draft):
     cols = {
         PC_COL_STATUS: {"label": "New Orders"},
         PC_COL_NOTES: powder_txt[:1900],
+        # WO# in a plain-text column so the powder-status sync can find this card
+        # by filtering on it (monday can't filter the link column by text).
+        PC_COL_ORDER_NO: draft["name"],
         PC_COL_DRAFT_LINK: {"url": draft_link, "text": f"Draft {draft['name']}"},
     }
     if DRY_RUN:

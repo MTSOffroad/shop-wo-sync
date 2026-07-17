@@ -41,11 +41,11 @@ MONDAY_GQL = "https://api.monday.com/v2"
 
 # Shop Work Orders columns
 SHOP_PC_COL = "color_mm5bzr35"       # Powdercoat (None / Powdercoat Needed / Powdercoat Ready)
-SHOP_LINK_COL = "link_mm5ardz5"      # Shopify Link (holds the draft URL)
+SHOP_WO_COL = "text_mm5athg0"        # WO # (e.g. "#D8303") — the correlation key
 
 # Powdercoat Jobs columns
 PC_STATUS_COL = "status"
-PC_DRAFT_LINK_COL = "link_mm5b171t"  # "Draft Order" link back to Shopify
+PC_ORDER_NO_COL = "text7__1"         # "Order #" — holds the WO#; filterable (unlike the link)
 
 NEEDED_LABEL = "Powdercoat Needed"
 READY_LABEL = "Powdercoat Ready"
@@ -78,20 +78,13 @@ def monday_gql(query, variables=None):
     return data["data"]
 
 
-def draft_id_from_link(value):
-    """Parse the Shopify draft numeric id from a monday link column value."""
-    if not value:
-        return None
-    try:
-        url = json.loads(value).get("url", "")
-    except Exception:
-        url = ""
-    m = re.search(r"/draft_orders/(\d+)", url)
-    return m.group(1) if m else None
+def wo_key(wo):
+    """Normalize a WO# for filtering (drop a leading '#' so contains_text is clean)."""
+    return (wo or "").lstrip("#").strip()
 
 
 def fetch_pending_shop_items():
-    """Shop items currently flagged 'Powdercoat Needed', with their draft id."""
+    """Shop items currently flagged 'Powdercoat Needed', with their WO#."""
     query = """
     query ShopItems($board: ID!, $cursor: String) {
       boards(ids: [$board]) {
@@ -99,7 +92,7 @@ def fetch_pending_shop_items():
           cursor
           items {
             id
-            column_values(ids: ["color_mm5bzr35", "link_mm5ardz5"]) { id text value }
+            column_values(ids: ["color_mm5bzr35", "text_mm5athg0"]) { id text value }
           }
         }
       }
@@ -115,29 +108,33 @@ def fetch_pending_shop_items():
             pc_text = (cv.get(SHOP_PC_COL) or {}).get("text") or ""
             if pc_text != NEEDED_LABEL:
                 continue
-            draft_id = draft_id_from_link((cv.get(SHOP_LINK_COL) or {}).get("value"))
-            if draft_id:
-                pending.append({"item_id": it["id"], "draft_id": draft_id})
+            wo = (cv.get(SHOP_WO_COL) or {}).get("text") or ""
+            if wo.strip():
+                pending.append({"item_id": it["id"], "wo": wo.strip()})
         cursor = page.get("cursor")
         if not cursor:
             break
     return pending
 
 
-def powder_status_for_draft(draft_id):
-    """Return the status text of the powder card linked to this draft, or None."""
+def powder_status_for_wo(wo):
+    """Return the status text of the powder card for this WO#, or None.
+
+    Matches on the powder card's "Order #" text column (which holds the WO#),
+    because monday cannot filter the link column by text.
+    """
     query = """
-    query PowderByDraft($board: ID!, $draft: String!) {
+    query PowderByWO($board: ID!, $wo: String!) {
       boards(ids: [$board]) {
         items_page(limit: 5, query_params: {
-          rules: [{column_id: "link_mm5b171t", compare_value: [$draft], operator: contains_text}]
+          rules: [{column_id: "text7__1", compare_value: $wo, operator: contains_text}]
         }) {
           items { id column_values(ids: ["status"]) { id text } }
         }
       }
     }
     """
-    data = monday_gql(query, {"board": POWDER_BOARD_ID, "draft": draft_id})
+    data = monday_gql(query, {"board": POWDER_BOARD_ID, "wo": wo_key(wo)})
     items = data["boards"][0]["items_page"]["items"]
     if not items:
         return None
@@ -182,10 +179,10 @@ def main():
 
     for item in pending:
         try:
-            status = powder_status_for_draft(item["draft_id"])
+            status = powder_status_for_wo(item["wo"])
             if status in DONE_POWDER_STATUSES:
                 set_powdercoat_ready(item["item_id"])
-                log(f"  ✓ item {item['item_id']} (draft {item['draft_id']}) "
+                log(f"  ✓ item {item['item_id']} ({item['wo']}) "
                     f"-> {READY_LABEL} (powder '{status}')")
                 ready += 1
             else:
