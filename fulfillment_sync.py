@@ -10,20 +10,20 @@ Business rules (decided with the shop):
   * Job type comes from the board's "Car or Shocks?" column (color_mm5agxce),
     which mirrors the Shopify custom.car_or_shocks_ metafield. Values ending in
     "(Ship-in)" are ship-ins; "(Walk-in)" are walk-ins.
-  * SHIP-IN, before QC Finished:  place a fulfillment HOLD on the order and tag
-    it "ship-in-hold", so the shipping team can't send it out mid-service.
-  * SHIP-IN, at QC Finished:       RELEASE the hold, swap the tag to
-    "ready-to-ship". Shipping then packs, adds tracking, and fulfills MANUALLY
-    (this script never fulfills a ship-in).
-  * WALK-IN, at QC Finished:       auto-mark the order FULFILLED (customer picks
-    up in person, nothing ships), tag "walk-in-fulfilled".
+  * ANY paid shop order, before QC Finished:  place a fulfillment HOLD and tag it
+    "shop-hold", so nobody can fulfill/ship it while the work is still in progress
+    (protects walk-ins AND ship-ins that were paid up front).
+  * At QC Finished, WALK-IN:  RELEASE the hold and auto-mark the order FULFILLED
+    (customer picks up in person, nothing ships), tag "walk-in-fulfilled".
+  * At QC Finished, SHIP-IN:  RELEASE the hold and swap the tag to "ready-to-ship".
+    Shipping then packs, adds tracking, and fulfills MANUALLY (never auto-fulfilled).
 
 Everything is gated on a real paid ORDER existing (fulfillment lives on orders,
 not drafts). If a work order is still an unpaid draft, there is nothing to hold
 or fulfill and it is skipped — which is correct: a non-existent order can't be
 shipped early. Pay-at-the-end jobs simply get handled once their order appears.
 
-Idempotency is enforced with ORDER TAGS (ship-in-hold / ready-to-ship /
+Idempotency is enforced with ORDER TAGS (shop-hold / ready-to-ship /
 walk-in-fulfilled) plus the live fulfillment-order state, so running every
 minute never double-holds, double-releases, or double-fulfills.
 
@@ -65,8 +65,8 @@ COL_CAR_OR_SHOCKS = "color_mm5agxce"
 COL_LINK = "link_mm5ardz5"
 
 # Order tags used as idempotency markers.
-TAG_HOLD = "ship-in-hold"
-TAG_READY = "ready-to-ship"
+TAG_HOLD = "shop-hold"           # placed on ANY paid shop order until QC Finished
+TAG_READY = "ready-to-ship"      # ship-in: released, waiting for shipping to pack
 TAG_FULFILLED = "walk-in-fulfilled"
 
 # Statuses that mean "QC is done / job complete" — the trigger point for
@@ -313,62 +313,61 @@ def is_done(status):
     return status in DONE_STATUSES
 
 
-def process_ship_in(item, order):
-    """Hold before QC; release + retag at QC Finished."""
+def process_order(item, order):
+    """Hold EVERY paid shop order until QC Finished, then branch by job type:
+      - walk-in : release the hold and auto-fulfill (in-person pickup, nothing ships)
+      - ship-in : release the hold and tag ready-to-ship (shipping packs & ships)
+    Idempotent via order tags. Never fulfills a ship-in. Anything not clearly a
+    ship-in is treated as walk-in.
+    """
     order_gid = order["id"]
     tags = order["tags"]
     fos = order["fulfillment_orders"]
-    # Fulfillment orders we can still act on (open / in progress / on hold).
-    actionable = [fo for fo in fos if fo["status"] in ("OPEN", "IN_PROGRESS", "ON_HOLD", "SCHEDULED")]
+    ship_in = is_ship_in(item["job_type"])
 
-    if is_done(item["status"]):
-        # Release any of OUR holds and hand off to shipping.
-        released = False
-        for fo in actionable:
-            hold_ids = [h["id"] for h in (fo.get("fulfillmentHolds") or [])]
-            if hold_ids:
-                release_fulfillment_order(fo["id"], hold_ids)
-                released = True
-        if released or TAG_HOLD in tags:
-            if TAG_HOLD in tags:
-                order_tags_remove(order_gid, [TAG_HOLD])
-            if TAG_READY not in tags:
-                order_tags_add(order_gid, [TAG_READY])
-            return f"released ship-in hold -> ready-to-ship ({order['name']})"
-        return None
-    else:
-        # Pre-QC: ensure a hold is in place.
+    # -------- Pre-QC: ensure a hold on the order --------
+    if not is_done(item["status"]):
         if TAG_HOLD in tags:
             return None  # already held (idempotent)
         held = False
-        for fo in actionable:
-            already = bool(fo.get("fulfillmentHolds"))
-            if fo["status"] in ("OPEN", "SCHEDULED") and not already:
+        for fo in fos:
+            if fo["status"] in ("OPEN", "SCHEDULED") and not fo.get("fulfillmentHolds"):
                 hold_fulfillment_order(fo["id"])
                 held = True
         if held:
             order_tags_add(order_gid, [TAG_HOLD])
-            return f"placed ship-in hold ({order['name']})"
+            return f"placed hold ({order['name']})"
         return None
 
+    # -------- QC Finished (or later): release the hold, then branch --------
+    released = False
+    for fo in fos:
+        hold_ids = [h["id"] for h in (fo.get("fulfillmentHolds") or [])]
+        if hold_ids:
+            release_fulfillment_order(fo["id"], hold_ids)
+            released = True
+    if TAG_HOLD in tags:
+        order_tags_remove(order_gid, [TAG_HOLD])
 
-def process_walk_in(item, order):
-    """At QC Finished, auto-fulfill (in-person pickup, nothing ships)."""
-    if not is_done(item["status"]):
+    if ship_in:
+        newly = TAG_READY not in tags
+        if newly:
+            order_tags_add(order_gid, [TAG_READY])
+        if released or newly:
+            return f"released hold -> ready-to-ship ({order['name']})"
         return None
-    order_gid = order["id"]
-    tags = order["tags"]
+
+    # walk-in: auto-fulfill (nothing ships)
     if TAG_FULFILLED in tags:
         return None
     if (order["fulfillment_status"] or "").upper() == "FULFILLED":
-        # Already fulfilled by hand — just record it so we stop checking.
-        order_tags_add(order_gid, [TAG_FULFILLED])
+        order_tags_add(order_gid, [TAG_FULFILLED])  # fulfilled by hand — record it
         return None
-    fos = order["fulfillment_orders"]
     fulfilled = False
     for fo in fos:
-        # Only fulfill open FOs that still have unfulfilled quantity.
-        if fo["status"] in ("OPEN", "IN_PROGRESS"):
+        # A held FO becomes OPEN once released; include ON_HOLD to cover the
+        # in-memory-stale case (we just released it earlier in this same run).
+        if fo["status"] in ("OPEN", "IN_PROGRESS", "ON_HOLD", "SCHEDULED"):
             remaining = sum(e["node"]["remainingQuantity"]
                             for e in fo["lineItems"]["edges"])
             if remaining > 0:
@@ -376,7 +375,7 @@ def process_walk_in(item, order):
                 fulfilled = True
     if fulfilled:
         order_tags_add(order_gid, [TAG_FULFILLED])
-        return f"auto-fulfilled walk-in ({order['name']})"
+        return f"released + auto-fulfilled walk-in ({order['name']})"
     return None
 
 
@@ -402,19 +401,12 @@ def main():
     acted = skipped = no_order = failed = 0
 
     for it in items:
-        job = it["job_type"]
-        if not (is_ship_in(job) or is_walk_in(job)):
-            skipped += 1
-            continue
         try:
             order = get_order_for_draft(it["draft_id"])
             if not order:
-                no_order += 1  # still an unpaid draft — nothing to fulfill/hold
+                no_order += 1  # still an unpaid draft — nothing to hold/fulfill
                 continue
-            if is_ship_in(job):
-                result = process_ship_in(it, order)
-            else:
-                result = process_walk_in(it, order)
+            result = process_order(it, order)
             if result:
                 log(f"  ✓ {it['name']}: {result}")
                 acted += 1
