@@ -54,3 +54,22 @@ services:
         value: "MST"
       - key: TZ
         value: America/Phoenix      # Arizona MST (no DST) — matches the MST label
+
+  # --- monday status -> Shopify fulfillment (hold / release / auto-fulfill) ---
+  - type: cron
+    name: shop-wo-fulfillment
+    runtime: python
+    schedule: "* * * * *"          # every minute
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python fulfillment_sync.py"
+    envVars:
+      - key: SHOPIFY_STORE_DOMAIN
+        sync: false                # enter in dashboard
+      - key: SHOPIFY_ACCESS_TOKEN
+        sync: false                # secret — enter in dashboard
+      - key: MONDAY_API_TOKEN
+        sync: false                # secret — enter in dashboard
+      - key: MONDAY_BOARD_ID
+        value: "18422437311"
+      - key: TZ
+        value: America/Phoenix

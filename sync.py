@@ -54,6 +54,10 @@ COL_TURNAROUND = "timerange_mm52a7b2"  # Turn Around Time
 COL_SVC_NOTES = "text3"            # Service Writer Notes
 COL_HOURS = "numeric_mm0mfy8z"     # Hours (REQUIRED column — must be set on create)
 
+# Shopify custom metafield the service writer fills in with the job's hours.
+# Its value is pushed to the monday "Hours" column so the two stay aligned.
+MF_HOURS = "job_hours_"
+
 SHOPIFY_GQL = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
 MONDAY_GQL = "https://api.monday.com/v2"
 
@@ -94,10 +98,14 @@ def fetch_unsynced_shop_drafts():
     We filter server-side on status + tag, then check the shop_car_ metafield
     client-side (metafields aren't reliably filterable in the draftOrders query).
     """
+    # We scan BOTH open and completed drafts. "Pay up front" jobs get their
+    # draft completed into a real Order quickly; if we only scanned open drafts
+    # we could miss one that completed before this cycle ran. Completed drafts
+    # still expose their metafields and a link to the created `order`.
     query = """
     query UnsyncedShopDrafts($cursor: String) {
       draftOrders(first: 25, after: $cursor, sortKey: UPDATED_AT, reverse: true,
-                  query: "status:open") {
+                  query: "status:open OR status:completed") {
         pageInfo { hasNextPage endCursor }
         edges {
           node {
@@ -107,6 +115,8 @@ def fetch_unsynced_shop_drafts():
             createdAt
             tags
             email
+            status
+            order { id legacyResourceId tags }
             customer { displayName }
             metafields(first: 30) {
               edges { node { namespace key value type } }
@@ -124,8 +134,12 @@ def fetch_unsynced_shop_drafts():
         conn = data["draftOrders"]
         for edge in conn["edges"]:
             node = edge["node"]
-            tags = node.get("tags") or []
-            if SYNCED_TAG in tags:
+            draft_tags = node.get("tags") or []
+            order = node.get("order") or {}
+            order_tags = order.get("tags") or []
+            # Dedup marker lives on the draft (open drafts) OR the order
+            # (completed drafts, which may not be tag-updatable). Check both.
+            if SYNCED_TAG in draft_tags or SYNCED_TAG in order_tags:
                 continue  # already synced
             mf = {
                 e["node"]["key"]: e["node"]["value"]
@@ -142,24 +156,44 @@ def fetch_unsynced_shop_drafts():
     return results
 
 
-def tag_draft_synced(draft_gid, existing_tags):
-    """Add the SYNCED_TAG to a draft so it's never picked up again."""
-    new_tags = list(dict.fromkeys(list(existing_tags) + [SYNCED_TAG]))
+def mark_synced(draft):
+    """Add SYNCED_TAG so this work order is never picked up again.
+
+    If the draft has already been completed into a real Order (pay-up-front),
+    we tag the ORDER — completed drafts are not reliably tag-updatable, and
+    orders always are. Otherwise we tag the open draft. The read side checks
+    both places, so dedup holds either way.
+    """
+    order = draft.get("order") or {}
+    if order.get("id"):
+        target_gid = order["id"]
+        existing = order.get("tags") or []
+        where = f"order {order.get('legacyResourceId')}"
+    else:
+        target_gid = draft["id"]
+        existing = draft.get("tags") or []
+        where = f"draft {draft['name']}"
+
+    if SYNCED_TAG in existing:
+        return  # already tagged (belt and suspenders)
+
+    if DRY_RUN:
+        log(f"  DRY_RUN: would tag {where} with '{SYNCED_TAG}'")
+        return
+
+    # tagsAdd works for both Order and DraftOrder GIDs.
     mutation = """
-    mutation TagSynced($id: ID!, $input: DraftOrderInput!) {
-      draftOrderUpdate(id: $id, input: $input) {
-        draftOrder { id tags }
+    mutation MarkSynced($id: ID!, $tags: [String!]!) {
+      tagsAdd(id: $id, tags: $tags) {
+        node { id }
         userErrors { field message }
       }
     }
     """
-    if DRY_RUN:
-        log(f"  DRY_RUN: would tag {draft_gid} with '{SYNCED_TAG}'")
-        return
-    data = shopify_gql(mutation, {"id": draft_gid, "input": {"tags": new_tags}})
-    errs = data["draftOrderUpdate"]["userErrors"]
+    data = shopify_gql(mutation, {"id": target_gid, "tags": [SYNCED_TAG]})
+    errs = data["tagsAdd"]["userErrors"]
     if errs:
-        raise RuntimeError(f"Failed to tag draft: {errs}")
+        raise RuntimeError(f"Failed to tag {where}: {errs}")
 
 
 # ---------------------------------------------------------------------------
@@ -194,11 +228,20 @@ def build_column_values(draft):
     due = mf.get("due_date")  # "YYYY-MM-DD" or None
     svc_notes = mf.get("service_notes", "")
 
+    # Hours from the service writer's custom.job_hours_ metafield. The board's
+    # Hours column is required, so we always send a value — the metafield if
+    # present and numeric, otherwise 0 (a tech can fill it in later).
+    hours_raw = mf.get(MF_HOURS)
+    try:
+        hours_val = str(float(hours_raw)) if hours_raw not in (None, "") else "0"
+    except (TypeError, ValueError):
+        hours_val = "0"
+
     cols = {
         COL_WO: name,
         COL_LINK: {"url": link, "text": f"Open Draft {name}"},
         COL_STATUS: {"label": "Same Day (Not Built)" if same_day else "New"},
-        COL_HOURS: "0",  # required column; techs fill actual hours in later
+        COL_HOURS: hours_val,  # from custom.job_hours_; 0 if unset
     }
     if car_or_shocks:
         cols[COL_CAR_OR_SHOCKS] = {"label": car_or_shocks}
@@ -287,9 +330,9 @@ def main():
         wo = draft["name"]
         try:
             item_id = create_monday_item(draft)
-            # Only tag as synced AFTER the item is created — so a crash retries,
+            # Only mark synced AFTER the item is created — so a crash retries,
             # never duplicates.
-            tag_draft_synced(draft["id"], draft.get("tags") or [])
+            mark_synced(draft)
             log(f"  ✓ {wo} -> monday item {item_id} (synced)")
             created += 1
         except Exception as e:
