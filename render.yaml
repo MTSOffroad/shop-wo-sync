@@ -19,7 +19,7 @@ services:
     runtime: python
     schedule: "* * * * *"          # every minute
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python sync.py"
+    startCommand: "python sync.py; sleep 30; python sync.py"  # ~30s cadence
     envVars:
       - key: SHOPIFY_STORE_DOMAIN
         sync: false                # enter in dashboard
@@ -40,7 +40,7 @@ services:
     runtime: python
     schedule: "* * * * *"          # every minute
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python status_sync.py"
+    startCommand: "python status_sync.py; sleep 30; python status_sync.py"  # ~30s cadence
     envVars:
       - key: SHOPIFY_STORE_DOMAIN
         sync: false                # enter in dashboard
@@ -61,7 +61,7 @@ services:
     runtime: python
     schedule: "* * * * *"          # every minute
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python fulfillment_sync.py"
+    startCommand: "python fulfillment_sync.py; sleep 30; python fulfillment_sync.py"  # ~30s cadence
     envVars:
       - key: SHOPIFY_STORE_DOMAIN
         sync: false                # enter in dashboard
@@ -80,7 +80,7 @@ services:
     runtime: python
     schedule: "* * * * *"          # every minute
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python powder_status_sync.py"
+    startCommand: "python powder_status_sync.py; sleep 30; python powder_status_sync.py"  # ~30s cadence
     envVars:
       - key: MONDAY_API_TOKEN
         sync: false                # secret — enter in dashboard
