@@ -317,6 +317,40 @@ def create_monday_item(draft):
     return data["create_item"]["id"]
 
 
+def fetch_existing_wo_numbers():
+    """Return the set of WO#s (e.g. '#D8303') already on the monday board.
+
+    This is the authoritative dedup: the board itself is the source of truth for
+    'already synced'. Relying only on the Shopify 'synced-to-monday' tag is not
+    enough — that tag can lag behind writes (Shopify draft search is eventually
+    consistent) or get cleared when a draft is edited, either of which would
+    otherwise create a duplicate board item.
+    """
+    query = """
+    query BoardWOs($board: ID!, $cursor: String) {
+      boards(ids: [$board]) {
+        items_page(limit: 100, cursor: $cursor) {
+          cursor
+          items { column_values(ids: ["text_mm5athg0"]) { id text } }
+        }
+      }
+    }
+    """
+    wos = set()
+    cursor = None
+    while True:
+        data = monday_gql(query, {"board": MONDAY_BOARD_ID, "cursor": cursor})
+        page = data["boards"][0]["items_page"]
+        for it in page["items"]:
+            for c in it["column_values"]:
+                if c["id"] == "text_mm5athg0" and (c.get("text") or "").strip():
+                    wos.add(c["text"].strip())
+        cursor = page.get("cursor")
+        if not cursor:
+            break
+    return wos
+
+
 # ---------------------------------------------------------------------------
 # Powdercoat: flag the shop item + create a card on the powdercoater's board
 # ---------------------------------------------------------------------------
@@ -387,13 +421,28 @@ def main():
         log("No un-synced shop_car_ drafts found. Nothing to do.")
         return
 
-    log(f"Found {len(drafts)} un-synced shop work order draft(s).")
-    created, failed = 0, 0
+    # Authoritative dedup: which WO#s are already on the board. Guards against
+    # tag lag / tags cleared on edit (either of which would else duplicate).
+    try:
+        existing_wos = fetch_existing_wo_numbers()
+    except Exception as e:
+        die(f"Could not read monday board for dedup: {e}")
+
+    log(f"Found {len(drafts)} candidate draft(s); {len(existing_wos)} WO(s) already on board.")
+    created, skipped, failed = 0, 0, 0
 
     for draft in drafts:
         wo = draft["name"]
         try:
+            if wo in existing_wos:
+                # Already on the board — never create a second item. Just make
+                # sure the draft is (re)tagged so it stops showing up as un-synced.
+                mark_synced(draft)
+                log(f"  = {wo} already on board — skipped create, re-tagged")
+                skipped += 1
+                continue
             item_id = create_monday_item(draft)
+            existing_wos.add(wo)  # guard against same-run repeats
             # Only mark synced AFTER the item is created — so a crash retries,
             # never duplicates.
             mark_synced(draft)
@@ -409,7 +458,7 @@ def main():
             log(f"  ✗ {wo} FAILED: {e}")
             failed += 1
 
-    log(f"Done. Created {created}, failed {failed}.")
+    log(f"Done. Created {created}, skipped {skipped}, failed {failed}.")
     if failed:
         # Non-zero exit so the host's cron surfaces the failure in logs/alerts.
         sys.exit(2)
