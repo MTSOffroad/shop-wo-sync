@@ -73,6 +73,33 @@ def canonical_car_or_shocks(value):
     return _COS_BY_LOWER.get(str(value).strip().lower())
 
 
+def build_vehicle(mf):
+    """Combine the four vehicle metafields into one readable string, e.g.
+    "2024 Can-Am X3 XRS · Fox Internal Bypass · 2 Seat". Missing parts are
+    skipped so there are no dangling separators."""
+    year_model = " ".join(str(p).strip() for p in
+                          [mf.get("year"), mf.get("vehicle_model")]
+                          if p and str(p).strip())
+    parts = [year_model, mf.get("type_of_shocks"), mf.get("seats")]
+    return " · ".join(str(p).strip() for p in parts if p and str(p).strip())
+
+
+def build_services(mf):
+    """custom.services is a list.single_line_text_field, so its raw value is a
+    JSON array string like '["Rebuild","Revalve"]'. Join it for display; fall
+    back to the raw value if it isn't valid JSON."""
+    raw = mf.get("services")
+    if not raw:
+        return ""
+    try:
+        vals = json.loads(raw)
+        if isinstance(vals, list):
+            return ", ".join(str(v).strip() for v in vals if str(v).strip())
+    except Exception:
+        pass
+    return str(raw).strip()
+
+
 def order_admin_url(order_legacy_id):
     return f"https://admin.shopify.com/store/{SHOP_ADMIN_HANDLE}/orders/{order_legacy_id}"
 
@@ -112,6 +139,8 @@ def parse_shopify_link(value):
 COL_TURNAROUND = "timerange_mm52a7b2"  # Turn Around Time
 COL_SVC_NOTES = "text3"            # Service Writer Notes
 COL_HOURS = "numeric_mm0mfy8z"     # Hours (REQUIRED column — must be set on create)
+COL_VEHICLE = "text_mm5ezx65"      # Vehicle (year + model + shock type + seats)
+COL_SERVICES = "text_mm5e6xyj"     # Services (custom.services list)
 
 # Shopify custom metafield the service writer fills in with the job's hours.
 # Its value is pushed to the monday "Hours" column so the two stay aligned.
@@ -322,6 +351,13 @@ def build_column_values(draft):
         cols[COL_CAR_OR_SHOCKS] = {"label": car_or_shocks}
     if svc_notes:
         cols[COL_SVC_NOTES] = svc_notes[:1900]  # keep it sane
+
+    vehicle = build_vehicle(mf)
+    if vehicle:
+        cols[COL_VEHICLE] = vehicle[:1900]
+    services = build_services(mf)
+    if services:
+        cols[COL_SERVICES] = services[:1900]
     if due:
         cols[COL_DUE] = {"date": due}
 
@@ -487,7 +523,8 @@ def fetch_board_items_full():
             id
             name
             column_values(ids: ["date5","text3","color_mm5agxce",
-              "numeric_mm0mfy8z","color_mm5bzr35","link_mm5ardz5"]) { id text value }
+              "numeric_mm0mfy8z","color_mm5bzr35","link_mm5ardz5",
+              "text_mm5ezx65","text_mm5e6xyj"]) { id text value }
           }
         }
       }
@@ -515,6 +552,8 @@ def fetch_board_items_full():
                 "car_or_shocks": (cv.get("color_mm5agxce") or {}).get("text") or "",
                 "hours": (cv.get("numeric_mm0mfy8z") or {}).get("text") or "",
                 "powdercoat": (cv.get("color_mm5bzr35") or {}).get("text") or "",
+                "vehicle": (cv.get("text_mm5ezx65") or {}).get("text") or "",
+                "services": (cv.get("text_mm5e6xyj") or {}).get("text") or "",
             })
         cursor = page.get("cursor")
         if not cursor:
@@ -615,6 +654,14 @@ def diff_shopify_fields(item, entity):
     cos = canonical_car_or_shocks(mf.get("car_or_shocks_"))
     if cos and cos != item["car_or_shocks"]:
         changes[COL_CAR_OR_SHOCKS] = {"label": cos}
+
+    vehicle = build_vehicle(mf)[:1900]
+    if vehicle != item["vehicle"]:
+        changes[COL_VEHICLE] = vehicle
+
+    services = build_services(mf)[:1900]
+    if services != item["services"]:
+        changes[COL_SERVICES] = services
 
     # Hours: always sync from Shopify. Compare as floats to avoid churn (4 vs 4.0).
     desired_hours = _hours_str(mf)
