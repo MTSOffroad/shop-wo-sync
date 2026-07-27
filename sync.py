@@ -221,6 +221,7 @@ def fetch_unsynced_shop_drafts():
             status
             order { id legacyResourceId name tags }
             customer { displayName }
+            purchasingEntity { ... on PurchasingCompany { company { name } } }
             metafields(first: 30) {
               edges { node { namespace key value type } }
             }
@@ -252,6 +253,7 @@ def fetch_unsynced_shop_drafts():
             if str(mf.get("shop_car_", "")).lower() != "true":
                 continue  # not a shop work order
             node["_mf"] = mf
+            node["company"] = company_name(node.get("purchasingEntity"))
             results.append(node)
         if not conn["pageInfo"]["hasNextPage"]:
             break
@@ -375,8 +377,17 @@ def build_column_values(draft):
     return cols
 
 
+def company_name(purchasing_entity):
+    """Company name if the order/draft is tied to a B2B company, else None."""
+    return ((purchasing_entity or {}).get("company") or {}).get("name") or None
+
+
 def item_name_for(draft):
-    """Item name = customer / dealer only (no vehicle model)."""
+    """Item name = COMPANY name when there's a company account, otherwise the
+    customer/dealer name (never the vehicle)."""
+    company = draft.get("company")
+    if company:
+        return company
     cust = (draft.get("customer") or {}).get("displayName")
     if cust:
         return cust
@@ -566,7 +577,9 @@ def _entity_from_node(node, order):
           for e in node["metafields"]["edges"]
           if e["node"]["namespace"] == "custom"}
     return {"name": node["name"], "email": node.get("email"),
-            "customer": node.get("customer"), "_mf": mf, "order": order}
+            "customer": node.get("customer"),
+            "company": company_name(node.get("purchasingEntity")),
+            "_mf": mf, "order": order}
 
 
 def fetch_entities(items):
@@ -583,6 +596,7 @@ def fetch_entities(items):
         ... on DraftOrder {
           legacyResourceId name email
           customer { displayName }
+          purchasingEntity { ... on PurchasingCompany { company { name } } }
           order { legacyResourceId name }
           metafields(first: 30) { edges { node { namespace key value } } }
         }
@@ -603,6 +617,7 @@ def fetch_entities(items):
         ... on Order {
           legacyResourceId name email
           customer { displayName }
+          purchasingEntity { ... on PurchasingCompany { company { name } } }
           metafields(first: 30) { edges { node { namespace key value } } }
         }
       }
