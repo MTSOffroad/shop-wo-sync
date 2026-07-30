@@ -147,11 +147,21 @@ COL_SERVICES = "text_mm5e6xyj"     # Services (custom.services list)
 MF_HOURS = "job_hours_"
 
 # --- Powdercoat -------------------------------------------------------------
-# custom.powdercoat is a free-text metafield; ANY non-empty value flags the
-# work order as a powdercoat job. Its text (often the powder color) is carried
-# into the powdercoat card's notes.
-MF_POWDERCOAT = "powdercoat"
+# custom.powdercoat_true_or_false (boolean) is THE trigger: true = this work
+# order is a powdercoat job and should push to the powdercoat board. The
+# custom.powdercoat text metafield ("Powdercoat Notes") is carried into the
+# card's notes. The four color metafields feed the card's color dropdowns.
+MF_POWDERCOAT_FLAG = "powdercoat_true_or_false"  # boolean trigger
+MF_POWDERCOAT = "powdercoat"                     # "Powdercoat Notes" text
 COL_POWDERCOAT = "color_mm5bzr35"    # Shop board: Powdercoat status (None / Powdercoat Needed)
+
+# Shopify color metafield key -> powdercoat-board dropdown column id.
+POWDER_COLOR_MAP = {
+    "front_main_color": "dropdown6__1",    # Front Main Color
+    "front_tender_color": "dropdown1__1",  # Front Tender Color
+    "rear_main_color": "dropdown19__1",    # Rear Main Color
+    "rear_tender_color": "dropdown8__1",   # Rear Tender Color
+}
 
 # MTS Powdercoat Jobs board (7932059042) — the powdercoater's board.
 PC_BOARD_ID = "7932059042"
@@ -160,6 +170,11 @@ PC_COL_STATUS = "status"             # powder status
 PC_COL_NOTES = "text__1"             # "Notes" — holds the custom.powdercoat text
 PC_COL_ORDER_NO = "text7__1"         # "Order #" — WO# (plain text, so it's filterable)
 PC_COL_DRAFT_LINK = "link_mm5b171t"  # "Draft Order" — link back to the Shopify draft
+
+
+def wants_powdercoat(mf):
+    """True if the work order is flagged as a powdercoat job."""
+    return str(mf.get(MF_POWDERCOAT_FLAG, "")).strip().lower() == "true"
 
 SHOPIFY_GQL = f"https://{SHOPIFY_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
 MONDAY_GQL = "https://api.monday.com/v2"
@@ -345,9 +360,8 @@ def build_column_values(draft):
         COL_LINK: shopify_link_value(draft),
         COL_STATUS: {"label": "Same Day (Not Built)" if same_day else "New"},
         COL_HOURS: hours_val,  # from custom.job_hours_; 0 if unset
-        # Powdercoat flag: "Powdercoat Needed" if the metafield is filled, else "None".
-        COL_POWDERCOAT: {"label": "Powdercoat Needed"
-                         if str(mf.get(MF_POWDERCOAT, "")).strip() else "None"},
+        # Powdercoat flag from the boolean trigger metafield.
+        COL_POWDERCOAT: {"label": "Powdercoat Needed" if wants_powdercoat(mf) else "None"},
     }
     if car_or_shocks:
         cols[COL_CAR_OR_SHOCKS] = {"label": car_or_shocks}
@@ -459,7 +473,7 @@ def fetch_existing_wo_numbers():
 # Powdercoat: flag the shop item + create a card on the powdercoater's board
 # ---------------------------------------------------------------------------
 def is_powdercoat(draft):
-    return bool(str(draft["_mf"].get(MF_POWDERCOAT, "")).strip())
+    return wants_powdercoat(draft["_mf"])
 
 
 def handle_powdercoat(draft):
@@ -486,13 +500,21 @@ def handle_powdercoat(draft):
         PC_COL_ORDER_NO: draft["name"],
         PC_COL_DRAFT_LINK: {"url": draft_link, "text": f"Draft {draft['name']}"},
     }
+    # Front/rear main & tender colors -> the powder board's color dropdowns.
+    for mf_key, col_id in POWDER_COLOR_MAP.items():
+        color = str(mf.get(mf_key, "")).strip()
+        if color:
+            cols[col_id] = {"labels": [color]}
+
     if DRY_RUN:
         log(f"    DRY_RUN: would create powdercoat card '{name}' notes='{powder_txt}'")
         return
+    # create_labels_if_missing: true so free-text colors that aren't already in
+    # the dropdown get added rather than failing the whole card create.
     mutation = """
     mutation CreatePC($board: ID!, $group: String!, $name: String!, $cols: JSON!) {
       create_item(board_id: $board, group_id: $group, item_name: $name,
-                  column_values: $cols, create_labels_if_missing: false) { id }
+                  column_values: $cols, create_labels_if_missing: true) { id }
     }
     """
     data = monday_gql(mutation, {"board": PC_BOARD_ID, "group": PC_GROUP_NEW,
@@ -690,7 +712,7 @@ def diff_shopify_fields(item, entity):
 
     # Powdercoat: sync Needed/None, but never revert a "Powdercoat Ready".
     if item["powdercoat"] != "Powdercoat Ready":
-        desired_pc = "Powdercoat Needed" if str(mf.get(MF_POWDERCOAT, "")).strip() else "None"
+        desired_pc = "Powdercoat Needed" if wants_powdercoat(mf) else "None"
         if desired_pc != item["powdercoat"]:
             changes[COL_POWDERCOAT] = {"label": desired_pc}
 
