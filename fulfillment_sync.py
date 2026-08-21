@@ -337,18 +337,20 @@ def process_order(item, order):
     fos = order["fulfillment_orders"]
     ship_in = is_ship_in(item["job_type"])
 
-    # -------- Pre-QC: ensure a hold on the order --------
+    # -------- Pre-QC: ensure EVERY open fulfillment order is held --------
+    # Re-scanned every cycle (NOT short-circuited on the tag). When parts are
+    # added to an order later, Shopify puts them on a brand-new, unheld
+    # fulfillment order — this catches and holds those too.
     if not is_done(item["status"]):
-        if TAG_HOLD in tags:
-            return None  # already held (idempotent)
-        held = False
+        held = 0
         for fo in fos:
             if fo["status"] in ("OPEN", "SCHEDULED") and not fo.get("fulfillmentHolds"):
                 hold_fulfillment_order(fo["id"])
-                held = True
-        if held:
+                held += 1
+        if held and TAG_HOLD not in tags:
             order_tags_add(order_gid, [TAG_HOLD])
-            return f"placed hold ({order['name']})"
+        if held:
+            return f"held {held} new fulfillment order(s) ({order['name']})"
         return None
 
     # -------- QC Finished (or later): release the hold, then branch --------
