@@ -110,7 +110,12 @@ def draft_admin_url(draft_legacy_id):
 
 def shopify_link_value(draft):
     """The Shopify Link column value: point at the ORDER once the draft has been
-    paid/completed into one, otherwise the draft."""
+    paid/completed into one, otherwise the draft. An entity discovered directly
+    as an Order (kind == "order" — flagged post-payment) always links to the
+    order itself, since there's no separate draft-side record to prefer."""
+    if draft.get("kind") == "order":
+        return {"url": order_admin_url(draft["legacyResourceId"]),
+                "text": f"Open Order {draft.get('name') or ''}".strip()}
     order = draft.get("order") or {}
     if order.get("legacyResourceId"):
         return {"url": order_admin_url(order["legacyResourceId"]),
@@ -269,6 +274,72 @@ def fetch_unsynced_shop_drafts():
                 continue  # not a shop work order
             node["_mf"] = mf
             node["company"] = company_name(node.get("purchasingEntity"))
+            node["kind"] = "draft"
+            results.append(node)
+        if not conn["pageInfo"]["hasNextPage"]:
+            break
+        cursor = conn["pageInfo"]["endCursor"]
+    return results
+
+
+def fetch_unsynced_shop_orders():
+    """Return real Orders where shop_car_ = true and not yet synced.
+
+    Handles the case where the shop_car_ flag is set AFTER a draft is paid and
+    converted into an Order: staff then edit the Order's own metafields, which
+    is a completely separate Shopify record from the original draft, so
+    fetch_unsynced_shop_drafts() (which only reads metafields off the draft
+    object) can never see it. This is the other half of the trigger scan: it
+    looks at Orders directly for the same shop_car_ flag.
+
+    Server-side excludes already-tagged orders so they don't crowd out newer
+    candidates in the bounded recent-orders window (tagging bumps updatedAt,
+    so already-synced orders would otherwise float to the top of this sort
+    and could push genuine candidates out of the scan). Client-side re-checks
+    the tag anyway, same belt-and-suspenders pattern as the draft scan.
+    """
+    query = """
+    query UnsyncedShopOrders($cursor: String) {
+      orders(first: 25, after: $cursor, sortKey: UPDATED_AT, reverse: true,
+             query: "-tag:'synced-to-monday'") {
+        pageInfo { hasNextPage endCursor }
+        edges {
+          node {
+            id
+            legacyResourceId
+            name
+            createdAt
+            tags
+            email
+            customer { displayName }
+            purchasingEntity { ... on PurchasingCompany { company { name } } }
+            metafields(first: 30) {
+              edges { node { namespace key value type } }
+            }
+          }
+        }
+      }
+    }
+    """
+    results = []
+    cursor = None
+    for _ in range(6):
+        data = shopify_gql(query, {"cursor": cursor})
+        conn = data["orders"]
+        for edge in conn["edges"]:
+            node = edge["node"]
+            if SYNCED_TAG in (node.get("tags") or []):
+                continue  # already synced (query above should already exclude these)
+            mf = {
+                e["node"]["key"]: e["node"]["value"]
+                for e in node["metafields"]["edges"]
+                if e["node"]["namespace"] == "custom"
+            }
+            if str(mf.get("shop_car_", "")).lower() != "true":
+                continue  # not a shop work order
+            node["_mf"] = mf
+            node["company"] = company_name(node.get("purchasingEntity"))
+            node["kind"] = "order"
             results.append(node)
         if not conn["pageInfo"]["hasNextPage"]:
             break
@@ -282,17 +353,23 @@ def mark_synced(draft):
     If the draft has already been completed into a real Order (pay-up-front),
     we tag the ORDER — completed drafts are not reliably tag-updatable, and
     orders always are. Otherwise we tag the open draft. The read side checks
-    both places, so dedup holds either way.
+    both places, so dedup holds either way. An entity discovered directly as
+    an Order (kind == "order") is simply tagged on itself.
     """
-    order = draft.get("order") or {}
-    if order.get("id"):
-        target_gid = order["id"]
-        existing = order.get("tags") or []
-        where = f"order {order.get('legacyResourceId')}"
-    else:
+    if draft.get("kind") == "order":
         target_gid = draft["id"]
         existing = draft.get("tags") or []
-        where = f"draft {draft['name']}"
+        where = f"order {draft.get('legacyResourceId')} (flagged post-payment)"
+    else:
+        order = draft.get("order") or {}
+        if order.get("id"):
+            target_gid = order["id"]
+            existing = order.get("tags") or []
+            where = f"order {order.get('legacyResourceId')}"
+        else:
+            target_gid = draft["id"]
+            existing = draft.get("tags") or []
+            where = f"draft {draft['name']}"
 
     if SYNCED_TAG in existing:
         return  # already tagged (belt and suspenders)
@@ -487,9 +564,15 @@ def handle_powdercoat(draft):
         return
     mf = draft["_mf"]
     name = item_name_for(draft)
-    legacy_id = draft["legacyResourceId"]
-    draft_link = (f"https://admin.shopify.com/store/{SHOP_ADMIN_HANDLE}"
-                  f"/draft_orders/{legacy_id}")
+    if draft.get("kind") == "order":
+        # Flagged post-payment: there's no draft-side record to link to.
+        link_url = order_admin_url(draft["legacyResourceId"])
+        link_text = f"Order {draft['name']}"
+    else:
+        legacy_id = draft["legacyResourceId"]
+        link_url = (f"https://admin.shopify.com/store/{SHOP_ADMIN_HANDLE}"
+                    f"/draft_orders/{legacy_id}")
+        link_text = f"Draft {draft['name']}"
     powder_txt = str(mf.get(MF_POWDERCOAT, "")).strip()
 
     cols = {
@@ -498,7 +581,7 @@ def handle_powdercoat(draft):
         # WO# in a plain-text column so the powder-status sync can find this card
         # by filtering on it (monday can't filter the link column by text).
         PC_COL_ORDER_NO: draft["name"],
-        PC_COL_DRAFT_LINK: {"url": draft_link, "text": f"Draft {draft['name']}"},
+        PC_COL_DRAFT_LINK: {"url": link_url, "text": link_text},
     }
     # Front/rear main & tender colors -> the powder board's color dropdowns.
     for mf_key, col_id in POWDER_COLOR_MAP.items():
@@ -764,10 +847,21 @@ def main():
     except Exception as e:
         die(f"Could not fetch Shopify drafts: {e}")
 
+    # Catches shop_car_ flagged AFTER a draft is paid and converted to an
+    # Order — that flag lands on the Order record, which the draft scan above
+    # never looks at (see fetch_unsynced_shop_orders docstring).
+    try:
+        orders = fetch_unsynced_shop_orders()
+    except Exception as e:
+        die(f"Could not fetch Shopify orders: {e}")
+    if orders:
+        log(f"Found {len(orders)} candidate order(s) flagged shop_car_ post-payment.")
+    drafts = drafts + orders
+
     created, skipped, failed = 0, 0, 0
 
     if not drafts:
-        log("No un-synced shop_car_ drafts found — skipping create pass.")
+        log("No un-synced shop_car_ drafts/orders found — skipping create pass.")
 
     # Authoritative dedup: which WO#s are already on the board. Guards against
     # tag lag / tags cleared on edit (either of which would else duplicate).
@@ -777,7 +871,7 @@ def main():
             existing_wos = fetch_existing_wo_numbers()
         except Exception as e:
             die(f"Could not read monday board for dedup: {e}")
-        log(f"Found {len(drafts)} candidate draft(s); "
+        log(f"Found {len(drafts)} candidate draft/order(s); "
             f"{len(existing_wos)} WO(s) already on board.")
 
     for draft in drafts:
