@@ -855,6 +855,25 @@ def main():
     except Exception as e:
         die(f"Could not fetch Shopify orders: {e}")
     if orders:
+        # A job whose shop_car_ flag was already true BEFORE payment shows up
+        # in BOTH scans: the draft scan (keyed by the draft's own WO#, e.g.
+        # "#D8915") AND this order scan (keyed by the order's name, e.g.
+        # "#19058") — Shopify carries the metafield on both records in that
+        # case. Those two WO# strings never match each other, so the
+        # existing_wos dedup below can't catch the collision — it would
+        # create TWO monday items for one job. Drop any order candidate whose
+        # id is already the linked order of a draft candidate from this same
+        # run; the draft scan owns that job.
+        linked_order_ids = {
+            d["order"]["legacyResourceId"]
+            for d in drafts
+            if d.get("order", {}).get("legacyResourceId")
+        }
+        before = len(orders)
+        orders = [o for o in orders if o["legacyResourceId"] not in linked_order_ids]
+        if len(orders) != before:
+            log(f"  (skipped {before - len(orders)} order candidate(s) already "
+                f"owned by a draft candidate this run)")
         log(f"Found {len(orders)} candidate order(s) flagged shop_car_ post-payment.")
     drafts = drafts + orders
 
