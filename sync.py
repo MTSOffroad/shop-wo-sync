@@ -221,14 +221,19 @@ def fetch_unsynced_shop_drafts():
     We filter server-side on status + tag, then check the shop_car_ metafield
     client-side (metafields aren't reliably filterable in the draftOrders query).
     """
-    # We scan BOTH open and completed drafts. "Pay up front" jobs get their
-    # draft completed into a real Order quickly; if we only scanned open drafts
-    # we could miss one that completed before this cycle ran. Completed drafts
-    # still expose their metafields and a link to the created `order`.
+    # We scan open, invoice_sent, AND completed drafts. "Pay up front" jobs get
+    # their draft completed into a real Order quickly; if we only scanned open
+    # drafts we could miss one that completed before this cycle ran. invoice_sent
+    # covers "pay later"/invoiced drafts (e.g. same-day walk-ins invoiced before
+    # payment) that Shopify moves out of "open" but that are not yet "completed"
+    # either -- a draft sitting in that status was previously invisible to this
+    # query entirely (see D9018, 2026-09-22: shop_car_=true, never synced,
+    # because status:open OR status:completed silently excluded it). Completed
+    # drafts still expose their metafields and a link to the created `order`.
     query = """
     query UnsyncedShopDrafts($cursor: String) {
       draftOrders(first: 25, after: $cursor, sortKey: UPDATED_AT, reverse: true,
-                  query: "status:open OR status:completed") {
+                  query: "status:open OR status:invoice_sent OR status:completed") {
         pageInfo { hasNextPage endCursor }
         edges {
           node {
